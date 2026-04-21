@@ -56,11 +56,23 @@ pub struct Args {
     /// For PRs, set this to a checkout of the PRs base branch.
     #[arg(long)]
     base: PathBuf,
+
+    /// Subpath inside Nixpkgs that holds a by-name structure to check.
+    ///
+    /// Can be given multiple times to check multiple by-name directories that contribute to the
+    /// same top-level package set. Defaults to `pkgs/by-name` when not specified.
+    #[arg(long = "by-name-subpath")]
+    by_name_subpaths: Vec<String>,
 }
 
 fn main() -> ExitCode {
     let args = Args::parse();
-    let status: ColoredStatus = process(args.base, &args.nixpkgs).into();
+    let by_name_subpaths = if args.by_name_subpaths.is_empty() {
+        vec!["pkgs/by-name".to_owned()]
+    } else {
+        args.by_name_subpaths
+    };
+    let status: ColoredStatus = process(args.base, &args.nixpkgs, &by_name_subpaths).into();
     eprintln!("{status}");
     status.into()
 }
@@ -70,11 +82,13 @@ fn main() -> ExitCode {
 /// # Arguments
 /// - `base_nixpkgs`: Path to the base Nixpkgs to run ratchet checks against.
 /// - `main_nixpkgs`: Path to the main Nixpkgs to check.
-fn process(base_nixpkgs: PathBuf, main_nixpkgs: &Path) -> Status {
-    let by_name_subpath = "pkgs/by-name";
+/// - `by_name_subpaths`: Subpaths inside Nixpkgs that hold by-name structures, all feeding into
+///   the top-level package set.
+fn process(base_nixpkgs: PathBuf, main_nixpkgs: &Path, by_name_subpaths: &[String]) -> Status {
+    let base_subpaths = by_name_subpaths.to_vec();
     // Very easy to parallelise this, since both operations are totally independent of each other.
-    let base_thread = thread::spawn(move || check_nixpkgs(&base_nixpkgs, by_name_subpath));
-    let main_result = match check_nixpkgs(main_nixpkgs, by_name_subpath) {
+    let base_thread = thread::spawn(move || check_nixpkgs(&base_nixpkgs, &base_subpaths));
+    let main_result = match check_nixpkgs(main_nixpkgs, by_name_subpaths) {
         Ok(result) => result,
         Err(error) => {
             return error.into();
@@ -103,14 +117,14 @@ fn process(base_nixpkgs: PathBuf, main_nixpkgs: &Path) -> Status {
     }
 }
 
-/// Checks whether the by-name structure at the given path in Nixpkgs is valid.
+/// Checks whether the by-name structures at the given paths in Nixpkgs are valid.
 ///
 /// This does not include ratchet checks, see ../README.md#ratchet-checks
 /// Instead a `ratchet::Nixpkgs` value is returned, whose `compare` method allows performing the
 /// ratchet check against another result.
 fn check_nixpkgs(
     nixpkgs_path: &Path,
-    by_name_subpath: &str,
+    by_name_subpaths: &[String],
 ) -> validation::Result<ratchet::Nixpkgs> {
     let nixpkgs_path = nixpkgs_path.canonicalize().with_context(|| {
         format!(
@@ -121,9 +135,12 @@ fn check_nixpkgs(
 
     let mut nix_file_store = NixFileStore::default();
 
-    let package_result = {
-        if !nixpkgs_path.join(by_name_subpath).exists() {
-            // No directory at the given location (e.g. pkgs/by-name), always valid
+    let mut combined_packages: validation::Validation<BTreeMap<String, ratchet::Package>> =
+        Success(BTreeMap::new());
+
+    for by_name_subpath in by_name_subpaths {
+        let package_result = if !nixpkgs_path.join(by_name_subpath).exists() {
+            // No directory at this by-name subpath, nothing to check for it.
             Success(BTreeMap::new())
         } else {
             let structure = check_structure(&nixpkgs_path, &mut nix_file_store, by_name_subpath)?;
@@ -137,13 +154,18 @@ fn check_nixpkgs(
                     package_names.as_slice(),
                 )
             })?
-        }
-    };
+        };
+
+        combined_packages = combined_packages.and(package_result, |mut acc, new| {
+            acc.extend(new);
+            acc
+        });
+    }
 
     let file_result = files::check_files(&nixpkgs_path, &mut nix_file_store)?;
 
     Ok(
-        package_result.and(file_result, |packages, files| ratchet::Nixpkgs {
+        combined_packages.and(file_result, |packages, files| ratchet::Nixpkgs {
             packages,
             files,
         }),
@@ -272,7 +294,7 @@ mod tests {
         let nix_conf_dir = nix_conf_dir.path().as_os_str();
 
         let status = temp_env::with_var("NIX_CONF_DIR", Some(nix_conf_dir), || {
-            process(base_nixpkgs, &main_path)
+            process(base_nixpkgs, &main_path, &["pkgs/by-name".to_owned()])
         });
 
         let actual_errors = format!("{status}\n");
